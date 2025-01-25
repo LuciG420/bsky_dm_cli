@@ -1,0 +1,55 @@
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use std::error::Error;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Message {
+    text: String,
+    // Add other fields as needed
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MessageResponse {
+    messages: Vec<Message>,
+    // Add other response fields as needed
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let access_token = "YOUR_ACCESS_TOKEN";
+    let client = Client::new();
+
+    // Example: List Direct Messages
+    let list_messages_url = "https://bsky.app/api/v1/direct_messages/list";
+    let list_messages_response = client
+        .get(list_messages_url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .send()
+        .await?
+        .json::<MessageResponse>()
+        .await?;
+
+    println!("Direct Messages: {:?}", list_messages_response.messages);
+
+    // Example: Send a Direct Message
+    let send_message_url = "https://bsky.app/api/v1/direct_messages/create";
+    let message = Message {
+        text: "Hello, this is a test message!".to_string(),
+    };
+
+    let send_message_response = client
+        .post(send_message_url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .json(&message)
+        .send()
+        .await?;
+
+    if send_message_response.status().is_success() {
+        println!("Message sent successfully!");
+    } else {
+        println!("Failed to send message: {:?}", send_message_response.text().await?);
+    }
+
+    Ok(())
+}
+
