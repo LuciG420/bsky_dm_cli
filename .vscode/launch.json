@@ -1,0 +1,45 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'bsky_direct_messages'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=bsky_direct_messages",
+                    "--package=bsky_direct_messages"
+                ],
+                "filter": {
+                    "name": "bsky_direct_messages",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in executable 'bsky_direct_messages'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--bin=bsky_direct_messages",
+                    "--package=bsky_direct_messages"
+                ],
+                "filter": {
+                    "name": "bsky_direct_messages",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

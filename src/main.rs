@@ -1,158 +1,123 @@
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use anyhow::{Context, Ok, Result};
+use atrium_api::{
+    AtpClient,
+    types::{
+        app::bsky::feed::Post,
+        com::atproto::server::CreateSession,
+    }
+};
+use ably::Rest as AblyRest;
+use dotenv::dotenv;
 use serde_json::json;
+use tokio::{
+    task,
+    sync::mpsc,
+    time::{sleep, Duration}
+};
+use std::{env, fmt::Error};
+use tracing::{info, error, Level};
+use tracing_subscriber;
 
-use clap::{Parser, Subcommand};
-//use clap::command;
-
-#[derive(Parser)]
-#[command(author, version, about, long_about = None)]
-#[command(propagate_version = true)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-    /// Sets a custom config file
-    #[arg(short, long, value_name = "FILE")]
-    config: Option<PathBuf>,
-
-    /// Turn debugging information on
-    #[arg(short, long, action = clap::ArgAction::Count)]
-    debug: u8,
+struct BskyXrpcDaemon {
+    atp_client: AtpClient,
+    ably_client: AblyRest,
+    channel_name: String,
 }
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Adds files to myapp
-    Add { name: Option<String> },
-    /// Login with an app token
-    Login {
-        /// The app token
-        token: String,
-    },
-    /// Send a direct message
-    Send {
-        /// The recipient's username
-        recipient: String,
-        /// The message text
-        message: String,
-    },
-    /// Get the latest direct messages
-    Get,
-}
+impl BskyXrpcDaemon {
+    async fn new() -> Result<Self> {
+        dotenv().ok();
 
-// Define the API response structure
-#[derive(Deserialize, Serialize)]
-struct Message {
-    id: String,
-    text: String,
-    sender: String,
-    recipient: String,
-}
+        let username = env::var("BSKY_USERNAME")?;
+        let password = env::var("BSKY_PASSWORD")?;
+        let ably_api_key = env::var("ABLY_API_KEY")?;
 
-// Define the API client
-struct BskyClient {
-    client: Client,
-    api_url: String,
-    token: Option<String>,
-}
+        let atp_client = AtpClient::create_session(CreateSession {
+            identifier: username,
+            password: password.clone(),
+        }).await?;
 
-impl BskyClient {
-    fn new(api_url: String) -> Self {
-        Self {
-            client: Client::new(),
-            api_url,
-            token: None,
+        let ably_client = AblyRest::new(&ably_api_key)?;
+
+        Ok(Self {
+            atp_client,
+            ably_client,
+            channel_name: "bsky-events".to_string(),
+        })
+    }
+
+    async fn stream_posts(&self, tx: mpsc::Sender<Post>) -> Result<()> {
+        loop {
+            match self.atp_client.stream_posts().await {
+                Ok(post) => {
+                    tx.send(post).await?;
+                },
+                Err(e) => {
+                    error!("Post streaming error: {}", e);
+                    sleep(Duration::from_secs(5)).await;
+                }
+            }
         }
     }
 
-    async fn login(&mut self, token: &str) -> Result<(), reqwest::Error> {
-        let url = format!("{}/api/v1/auth/app", self.api_url);
-        let json = json!({
-            "token": token,
-        });
-        let response = self.client.post(url).json(&json).send().await?;
-        if response.status().is_success() {
-            self.token = Some(token.to_string());
-            Ok(())
-        } else {
-            Err(response.error_for_status().unwrap_err())
+    async fn stream_notifications(&self, tx: mpsc::Sender<Post>) -> Result<()> {
+        loop {
+            match self.atp_client.stream_notifications().await {
+                Ok(notification) => {
+                    // Convert notification to post-like structure
+                    let post = notification.convert_to_post();
+                    tx.send(post).await?;
+                },
+                Err(e) => {
+                    error!("Notification streaming error: {}", e);
+                    sleep(Duration::from_secs(5)).await;
+                }
+            }
         }
     }
 
-    async fn send_message(&self, recipient: &str, message: &str) -> Result<Message, reqwest::Error> {
-        if self.token.is_none() {
-            return Err(reqwest::Error::from(()));
+    async fn publish_events(&self, mut rx: mpsc::Receiver<Post>) -> Result<()> {
+        let channel = self.ably_client.channel(&self.channel_name);
+
+        while let Some(post) = rx.recv().await {
+            let event_data = json!({
+                "type": "post",
+                "did": post.author.did,
+                "text": post.record.text,
+                "timestamp": post.record.created_at
+            });
+
+            channel.publish("post", event_data).await?;
+            info!("Published post event from {}", post.author.did);
         }
-        let url = format!("{}/api/v1/dm/send", self.api_url);
-        let json = json!({
-            "recipient": recipient,
-            "text": message,
-        });
-        let response = self.client.post(url)
-            .header("Authorization", format!("Bearer {}", self.token.as_ref().unwrap()))
-            .json(&json)
-            .send()
-            .await?;
-        let message: Message = response.json().await?;
-        Ok(message)
+
+        Ok(())
     }
 
-    async fn get_messages(&self) -> Result<Vec<Message>, reqwest::Error> {
-        if self.token.is_none() {
-            return Err(reqwest::Error::from(()));
-        }
-        let url = format!("{}/api/v1/dm/inbox", self.api_url);
-        let response = self.client.get(url)
-            .header("Authorization", format!("Bearer {}", self.token.as_ref().unwrap()))
-            .send()
-            .await?;
-        let messages: Vec<Message> = response.json().await?;
-        Ok(messages)
+    pub async fn run(&self) -> Result<()> {
+        let (tx, rx) = mpsc::channel(100);
+
+        let posts_stream = task::spawn(self.stream_posts(tx.clone()));
+        let notifications_stream = task::spawn(self.stream_notifications(tx.clone()));
+        let event_publisher = task::spawn(self.publish_events(rx));
+
+            tokio::try_join!(
+                posts_stream,
+                notifications_stream,
+                event_publisher
+            )?;
+        
+                Ok(())
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), reqwest::Error> {
-    let cli = Cli::parse();
-    let api_url = "https://bsky.app/api/v1".to_string();
-    let mut client = BskyClient::new(api_url);
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_max_level(Level::INFO)
+        .init();
 
-    // You can see how many times a particular flag or argument occurred
-    // Note, only flags can have multiple occurrences
-    match cli.debug {
-        0 => println!("Debug mode is off"),
-        1 => println!("Debug mode is kind of on"),
-        2 => println!("Debug mode is on"),
-        _ => println!("Don't be crazy"),
-    }
-
-    match cli.command {
-        Some(Commands::Login { token }) => {
-            client.login(&token).await?;
-            println!("Logged in successfully! {}", token);
-        }
-        Some(Commands::Send { recipient, message }) => {
-            if client.token.is_none() {
-                println!("Please login first! r: {}", recipient);
-                return Ok(());
-            }
-            let message = client.send_message(&recipient, &message).await?;
-            println!("Sent message: r:{} {}({})", recipient, message.text, message.id);
-        }
-        Some(Commands::Get) => {
-            if client.token.is_none() {
-                println!("Please login first!");
-                return Ok(());
-            }
-            let messages = client.get_messages().await?;
-            for message in messages {
-                println!("Message from {}: {}", message.sender, message.text);
-            }
-        }
-        None => {
-            println!("No command provided. Use --help for usage.");
-        }
-    }
-
+    let daemon = BskyXrpcDaemon::new();
+    daemon.run().await?;
     Ok(())
 }
